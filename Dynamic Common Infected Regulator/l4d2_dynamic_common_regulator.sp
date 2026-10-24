@@ -4,7 +4,7 @@
 #include <sourcemod>
 #include <left4dhooks>
 
-#define PLUGIN_VERSION "1.1.0"
+#define PLUGIN_VERSION "1.2.0"
 
 #define TEAM_SURVIVOR            2
 #define BASE_SURVIVORS           4      // Standard L4D2 survivor count; scaling starts above this.
@@ -49,16 +49,54 @@ char g_sKeyNames[][] =
     "MobMaxPending"
 };
 
+// ---------------------------------------------------------------------------
+// Cvar fallback for regular mob sizes.
+// Testing showed that, at least on vanilla maps, the Director reads regular
+// (natural) mob sizes straight from these cvars instead of through
+// CDirector::GetScriptValue, so the hook alone never scales them. For these
+// two settings only, the plugin writes a scaled value into the cvar and
+// always keeps track of the real ("base") value so it can be restored.
+// ---------------------------------------------------------------------------
+enum
+{
+    MOBCVAR_MIN = 0,
+    MOBCVAR_MAX,
+    MOBCVAR_COUNT
+};
+
+char g_sMobCvarNames[][] =
+{
+    "z_mob_spawn_min_size",
+    "z_mob_spawn_max_size"
+};
+
+// The Director key that represents the same setting. Used to avoid scaling
+// twice if the Director passes our already-scaled cvar value into the hook
+// as the default.
+int g_iMobCvarKey[] =
+{
+    KEY_MOB_MIN_SIZE,
+    KEY_MOB_MAX_SIZE
+};
+
+ConVar g_hMobCvar[MOBCVAR_COUNT];
+int    g_iMobBase[MOBCVAR_COUNT];     // Real value set by configs/admins/maps.
+int    g_iMobWritten[MOBCVAR_COUNT];  // Value this plugin last wrote.
+bool   g_bMobApplied[MOBCVAR_COUNT];  // true while the cvar holds a scaled value.
+bool   g_bWritingMobCvar;             // Guards our own writes in the change hook.
+
 ConVar g_hEnabled;
 ConVar g_hPercent;
 ConVar g_hMaxMultiplier;
 ConVar g_hValueCap;
 ConVar g_hDebug;
+ConVar g_hScaleMobCvars;
 
 // ConVar values read inside the Director hook are cached in globals, because
 // the hook runs very often and reading a ConVar is a native call.
 bool  g_bEnabled;
 bool  g_bDebug;
+bool  g_bScaleMobCvars;
 int   g_iValueCap;
 
 int   g_iLivingSurvivors;
@@ -111,7 +149,11 @@ public void OnPluginStart()
         "Print Director key changes to the server console. 1 = on, 0 = off.",
         FCVAR_NONE, true, 0.0, true, 1.0);
 
-    AutoExecConfig(true, "cge_l4d2_commonregulator");
+    g_hScaleMobCvars = CreateConVar("commonregulator_scale_mob_cvars", "1",
+        "Also scale z_mob_spawn_min_size / z_mob_spawn_max_size (regular hordes). Original values are restored on map end and plugin unload.",
+        FCVAR_NONE, true, 0.0, true, 1.0);
+
+    AutoExecConfig(true, "l4d2_dynamic_common_regulator");
 
     // Change hooks: whenever a cvar changes (including when AutoExecConfig
     // runs), the cached globals and the multiplier are refreshed immediately.
@@ -120,10 +162,26 @@ public void OnPluginStart()
     g_hMaxMultiplier.AddChangeHook(OnCvarChanged);
     g_hValueCap.AddChangeHook(OnCvarChanged);
     g_hDebug.AddChangeHook(OnCvarChanged);
+    g_hScaleMobCvars.AddChangeHook(OnCvarChanged);
 
     g_hKeyIndex = new StringMap();
     for (int i = 0; i < KEY_COUNT; i++)
         g_hKeyIndex.SetValue(g_sKeyNames[i], i);
+
+    for (int i = 0; i < MOBCVAR_COUNT; i++)
+    {
+        g_hMobCvar[i] = FindConVar(g_sMobCvarNames[i]);
+        if (g_hMobCvar[i] == null)
+        {
+            LogError("Cvar %s not found; regular mob size fallback disabled for it.", g_sMobCvarNames[i]);
+            continue;
+        }
+
+        // At this point the plugin has not written anything yet, so the
+        // current value is the real one.
+        g_iMobBase[i] = g_hMobCvar[i].IntValue;
+        g_hMobCvar[i].AddChangeHook(OnMobCvarChanged);
+    }
 
     HookEvent("player_spawn",       Event_SurvivorSpawnOrDeath);
     HookEvent("player_death",       Event_SurvivorSpawnOrDeath);
@@ -157,9 +215,10 @@ public void OnMapStart()
     g_hRecountTimer = null;
     g_hSafetyTimer = null;
 
-    // We intentionally do NOT read or overwrite z_* ConVars here. Original
-    // values always come from the Director through the hook, so nothing leaks
-    // over from the previous map.
+    // Apart from the two regular mob size cvars (which are restored to their
+    // base value on map end), no z_* ConVar is ever overwritten. Everything
+    // else comes from the Director through the hook, so nothing leaks over
+    // from the previous map.
     StartSafetyTimer();
     QueueRecount(1.0);
 }
@@ -191,6 +250,17 @@ public void OnMapEnd()
     g_hSafetyTimer = null;
 
     ResetState();
+
+    // Multiplier is back to 1.0 after ResetState, so this writes the base
+    // values back. The next map then starts from the real values.
+    ApplyMobCvars();
+}
+
+public void OnPluginEnd()
+{
+    // Never leave scaled values behind when the plugin is unloaded.
+    g_fMultiplier = 1.0;
+    ApplyMobCvars();
 }
 
 void ResetState()
@@ -220,16 +290,19 @@ public void OnCvarChanged(ConVar convar, const char[] oldValue, const char[] new
 {
     RefreshCvarCache();
 
-    if (convar == g_hValueCap || convar == g_hDebug)
+    if (convar == g_hValueCap || convar == g_hDebug || convar == g_hScaleMobCvars)
     {
         // A new cap changes the scaled results, so logs should print again.
         ClearDebugLog();
+
+        // Cap and the fallback toggle also change what the mob cvars should hold.
+        ApplyMobCvars();
         return;
     }
 
     // enabled / percent / max_multiplier: recompute the multiplier.
     // The survivor count keeps updating even while the plugin is disabled,
-    // so it is already correct when re-enabled (fixes the stale count in v3.2).
+    // so it is already correct when re-enabled.
     RecalculateMultiplier(true);
 }
 
@@ -237,7 +310,65 @@ void RefreshCvarCache()
 {
     g_bEnabled  = g_hEnabled.BoolValue;
     g_bDebug    = g_hDebug.BoolValue;
+    g_bScaleMobCvars = g_hScaleMobCvars.BoolValue;
     g_iValueCap = g_hValueCap.IntValue;
+}
+
+// ===========================================================================
+// Regular mob size cvar fallback
+// ===========================================================================
+
+// Writes base * multiplier into each mob cvar, or the base value itself when
+// scaling should not apply (plugin off, fallback off, or multiplier 1.0).
+// Safe to call any time: it only writes when the value actually differs.
+void ApplyMobCvars()
+{
+    bool active = g_bEnabled && g_bScaleMobCvars && g_fMultiplier != 1.0;
+
+    for (int i = 0; i < MOBCVAR_COUNT; i++)
+    {
+        if (g_hMobCvar[i] == null)
+            continue;
+
+        int desired = active ? ScaleDirectorValue(g_iMobBase[i]) : g_iMobBase[i];
+
+        g_iMobWritten[i] = desired;
+        g_bMobApplied[i] = (desired != g_iMobBase[i]);
+
+        if (g_hMobCvar[i].IntValue == desired)
+            continue;
+
+        // The flag tells OnMobCvarChanged that this change is ours, so it
+        // must not be mistaken for a new base value.
+        g_bWritingMobCvar = true;
+        g_hMobCvar[i].IntValue = desired;
+        g_bWritingMobCvar = false;
+    }
+}
+
+// Someone other than this plugin (server.cfg, a map config, an admin, or a
+// map's VScript via Convars.SetValue) changed a mob cvar. Treat the new value
+// as the new base, then re-apply scaling on the next frame. Writing to a cvar
+// from inside its own change hook risks recursion, hence RequestFrame.
+public void OnMobCvarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+    if (g_bWritingMobCvar)
+        return;
+
+    for (int i = 0; i < MOBCVAR_COUNT; i++)
+    {
+        if (convar != g_hMobCvar[i])
+            continue;
+
+        g_iMobBase[i] = StringToInt(newValue);
+        RequestFrame(Frame_ApplyMobCvars);
+        return;
+    }
+}
+
+public void Frame_ApplyMobCvars(any data)
+{
+    ApplyMobCvars();
 }
 
 // ===========================================================================
@@ -361,7 +492,6 @@ float ComputeMultiplier(int survivors)
         return 1.0;
 
     // The percentage is used as a float, so 12.5 really means 12.5%
-    // (v3.2 silently rounded it to 13).
     float multiplier = 1.0 + float(extraSurvivors) * g_hPercent.FloatValue / 100.0;
 
     // Upper bound: without it, 12 survivors x 100% = 9x commons -> edict crash risk.
@@ -389,6 +519,9 @@ void RecalculateMultiplier(bool forceLog)
         PrintToServer("[CommonRegulator] Enabled=%d Survivors=%d multiplier=%.2fx",
             g_bEnabled, g_iLivingSurvivors, g_fMultiplier);
     }
+
+    // Enabled state or multiplier may have changed: keep the mob cvars in sync.
+    ApplyMobCvars();
 }
 
 int ScaleDirectorValue(int original)
@@ -424,7 +557,6 @@ int ScaleDirectorValue(int original)
 // Do NOT use L4D2_OnGetScriptValueInt(key, retVal, hScope) for this: that
 // forward fires on the VScript VM value getter (Squirrel code reading a
 // value), not on Director option lookups, so it never sees these keys.
-// That was the reason v3.2/v3.3 never scaled anything.
 //
 // Called VERY often by the Director. Checks are ordered cheapest first so the
 // common case (4 players / plugin off) exits as fast as possible.
@@ -443,6 +575,21 @@ public Action L4D_OnGetScriptValueInt(const char[] key, int &retVal)
     int original = retVal;
     int scaled = ScaleDirectorValue(original);
 
+    // Double-scale guard: when the map's DirectorOptions does not define
+    // MobMinSize/MobMaxSize, the Director may pass the cvar value in as the
+    // default. If that equals the value our fallback just wrote, it is
+    // already scaled, so leave it alone. (A map script value that happens to
+    // equal our written value would also be skipped; that is a rare and
+    // harmless miss compared to scaling twice.)
+    for (int i = 0; i < MOBCVAR_COUNT; i++)
+    {
+        if (g_iMobCvarKey[i] == index && g_bMobApplied[i] && original == g_iMobWritten[i])
+        {
+            scaled = original;
+            break;
+        }
+    }
+
     g_bSeen[index] = true;
     g_iLastOriginal[index] = original;
     g_iLastScaled[index] = scaled;
@@ -456,7 +603,7 @@ public Action L4D_OnGetScriptValueInt(const char[] key, int &retVal)
     retVal = scaled;
 
     // IMPORTANT: the forward's documentation states the override value is
-    // only used when returning Plugin_Handled. v3.2 returned Plugin_Changed,
+    // only used when returning Plugin_Handled. v1.1.0 returned Plugin_Changed,
     // which risks being ignored. Plugin_Handled here does NOT block anything;
     // it just means "use the retVal I modified".
     return Plugin_Handled;
@@ -509,6 +656,19 @@ public Action Command_Debug(int client, int args)
 
         ReplyToCommand(client, "  %s : %d -> %d",
             g_sKeyNames[i], g_iLastOriginal[i], g_iLastScaled[i]);
+    }
+
+    ReplyToCommand(client, "[CommonRegulator] Mob cvar fallback=%d", g_bScaleMobCvars);
+    for (int i = 0; i < MOBCVAR_COUNT; i++)
+    {
+        if (g_hMobCvar[i] == null)
+        {
+            ReplyToCommand(client, "  %s : (cvar not found)", g_sMobCvarNames[i]);
+            continue;
+        }
+
+        ReplyToCommand(client, "  %s : base=%d -> current=%d",
+            g_sMobCvarNames[i], g_iMobBase[i], g_hMobCvar[i].IntValue);
     }
 
     return Plugin_Handled;
