@@ -4,7 +4,11 @@
 #include <sourcemod>
 #include <left4dhooks>
 
-#define PLUGIN_VERSION "1.0.0"
+#define PLUGIN_VERSION "1.1.0"
+
+#define TEAM_SURVIVOR            2
+#define BASE_SURVIVORS           4      // Standard L4D2 survivor count; scaling starts above this.
+#define SAFETY_RECOUNT_INTERVAL  3.0    // Seconds. Safety net in case an event is missed.
 
 public Plugin myinfo =
 {
@@ -15,184 +19,310 @@ public Plugin myinfo =
     url = "https://gitlab.com/iqrar99/l4d2-plugins"
 };
 
+// ---------------------------------------------------------------------------
+// Director keys that get scaled.
+// An integer index + StringMap keeps the hook lookup at a single native call
+// (a hash lookup) instead of a chain of 7 StrEqual calls on every Director
+// request.
+// ---------------------------------------------------------------------------
+enum
+{
+    KEY_COMMON_LIMIT = 0,
+    KEY_CM_COMMON_LIMIT,
+    KEY_MOB_SPAWN_SIZE,
+    KEY_MEGA_MOB_SIZE,
+    KEY_MOB_MIN_SIZE,
+    KEY_MOB_MAX_SIZE,
+    KEY_MOB_MAX_PENDING,
+    KEY_COUNT
+};
+
+// Order MUST match the enum above.
+char g_sKeyNames[][] =
+{
+    "CommonLimit",
+    "cm_CommonLimit",
+    "MobSpawnSize",
+    "MegaMobSize",
+    "MobMinSize",
+    "MobMaxSize",
+    "MobMaxPending"
+};
+
 ConVar g_hEnabled;
 ConVar g_hPercent;
+ConVar g_hMaxMultiplier;
+ConVar g_hValueCap;
+ConVar g_hDebug;
 
-int g_iLivingSurvivors;
+// ConVar values read inside the Director hook are cached in globals, because
+// the hook runs very often and reading a ConVar is a native call.
+bool  g_bEnabled;
+bool  g_bDebug;
+int   g_iValueCap;
 
-// Per-map/per-multiplier debug cache. This prevents the Director hook from
-// printing the same value every time the Director asks for it.
-int g_iLastOriginalCommon = -999999;
-int g_iLastOriginalMobSpawn = -999999;
-int g_iLastOriginalMegaMob = -999999;
-int g_iLastOriginalMobMin = -999999;
-int g_iLastOriginalMobMax = -999999;
-int g_iLastOriginalMobPending = -999999;
-int g_iLastFinalCommon = -999999;
-int g_iLastFinalMobSpawn = -999999;
-int g_iLastFinalMegaMob = -999999;
-int g_iLastFinalMobMin = -999999;
-int g_iLastFinalMobMax = -999999;
-int g_iLastFinalMobPending = -999999;
+int   g_iLivingSurvivors;
+float g_fMultiplier = 1.0;
+
+Handle g_hRecountTimer;   // One-shot recount timer (debounce).
+Handle g_hSafetyTimer;    // Repeating recount timer (safety net).
+
+StringMap g_hKeyIndex;    // "CommonLimit" -> KEY_COMMON_LIMIT, etc.
+
+// Last value seen per key, shown by sm_cge_debug.
+bool g_bSeen[KEY_COUNT];
+int  g_iLastOriginal[KEY_COUNT];
+int  g_iLastScaled[KEY_COUNT];
+
+// Last value printed per key, used to de-dup debug logs.
+bool g_bLogged[KEY_COUNT];
+int  g_iLoggedOriginal[KEY_COUNT];
+int  g_iLoggedScaled[KEY_COUNT];
+
+// ===========================================================================
+// Lifecycle
+// ===========================================================================
 
 public void OnPluginStart()
 {
-    g_hEnabled = CreateConVar(
-        "commonregulator",
-        "1",
-        "Enable dynamic common infected regulation. 1 = enabled, 0 = disabled.",
-        FCVAR_PLUGIN | FCVAR_SPONLY | FCVAR_NOTIFY,
-        true, 0.0,
-        true, 1.0
-    );
+    CreateConVar("commonregulator_version", PLUGIN_VERSION,
+        "CommonRegulator plugin version.",
+        FCVAR_NOTIFY | FCVAR_DONTRECORD);
 
-    g_hPercent = CreateConVar(
-        "commonregulator_percent_per_survivor",
-        "20",
-        "Percentage increase for each living survivor above 4. 20 = +20% per additional survivor.",
-        FCVAR_PLUGIN | FCVAR_SPONLY | FCVAR_NOTIFY,
-        true, 0.0,
-        true, 100.0
-    );
+    // Note: FCVAR_PLUGIN was removed back in Orange Box and has no effect,
+    // so it is no longer used.
+    g_hEnabled = CreateConVar("commonregulator", "1",
+        "Enable dynamic common infected regulation. 1 = enabled, 0 = disabled.",
+        FCVAR_NOTIFY, true, 0.0, true, 1.0);
+
+    g_hPercent = CreateConVar("commonregulator_percent_per_survivor", "20",
+        "Percentage increase for each living survivor above 4. 20 = +20% per additional survivor. Decimals allowed.",
+        FCVAR_NONE, true, 0.0, true, 100.0);
+
+    g_hMaxMultiplier = CreateConVar("commonregulator_max_multiplier", "2.5",
+        "Hard ceiling for the multiplier, regardless of survivor count. Protects against edict/entity overload.",
+        FCVAR_NONE, true, 1.0, true, 10.0);
+
+    g_hValueCap = CreateConVar("commonregulator_value_cap", "120",
+        "Maximum value any scaled Director key may reach. 0 = no cap. A map value already above the cap is kept as-is.",
+        FCVAR_NONE, true, 0.0, true, 1000.0);
+
+    g_hDebug = CreateConVar("commonregulator_debug", "0",
+        "Print Director key changes to the server console. 1 = on, 0 = off.",
+        FCVAR_NONE, true, 0.0, true, 1.0);
 
     AutoExecConfig(true, "cge_l4d2_commonregulator");
 
-    HookEvent("player_spawn", Event_PlayerSpawn);
-    HookEvent("player_death", Event_PlayerDeath);
-    HookEvent("survivor_rescued", Event_SurvivorRescued);
-    HookEvent("player_team", Event_PlayerTeam);
+    // Change hooks: whenever a cvar changes (including when AutoExecConfig
+    // runs), the cached globals and the multiplier are refreshed immediately.
+    g_hEnabled.AddChangeHook(OnCvarChanged);
+    g_hPercent.AddChangeHook(OnCvarChanged);
+    g_hMaxMultiplier.AddChangeHook(OnCvarChanged);
+    g_hValueCap.AddChangeHook(OnCvarChanged);
+    g_hDebug.AddChangeHook(OnCvarChanged);
 
-    RegConsoleCmd("sm_cge_debug", Command_Debug, "Show CommonRegulator survivor and Director debug state.");
+    g_hKeyIndex = new StringMap();
+    for (int i = 0; i < KEY_COUNT; i++)
+        g_hKeyIndex.SetValue(g_sKeyNames[i], i);
 
-    ResetDebugState();
+    HookEvent("player_spawn",       Event_SurvivorSpawnOrDeath);
+    HookEvent("player_death",       Event_SurvivorSpawnOrDeath);
+    HookEvent("player_team",        Event_AlwaysRecount);
+    HookEvent("survivor_rescued",   Event_AlwaysRecount);
+    HookEvent("defibrillator_used", Event_AlwaysRecount);
+    HookEvent("player_bot_replace", Event_AlwaysRecount);
+    HookEvent("bot_player_replace", Event_AlwaysRecount);
+
+    RegAdminCmd("sm_cge_debug", Command_Debug, ADMFLAG_GENERIC,
+        "Show CommonRegulator survivor and Director debug state.");
+
+    RefreshCvarCache();
+    ResetState();
 
     // Covers plugin load/reload while a map is already running.
-    CreateTimer(1.0, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
+    StartSafetyTimer();
+    QueueRecount(1.0);
 }
 
 public void OnMapStart()
 {
-    ResetDebugState();
+    ResetState();
 
-    // Wait until the map's Director/VScript has initialized. We intentionally
-    // do NOT read or overwrite z_* ConVars here. Those values can be leftovers
-    // from our previous map and are not a reliable source of map Director data.
-    CreateTimer(1.0, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
+    // Clear the handles here too (not only in OnMapEnd): a bot or player that
+    // disconnects AFTER OnMapEnd can create a new timer that then gets killed
+    // by the map change, leaving a stale handle that would block
+    // QueueRecount/StartSafetyTimer forever. If an old timer turns out to be
+    // still alive, its callback stops itself (see the identity checks in
+    // Timer_Recount/Timer_Safety).
+    g_hRecountTimer = null;
+    g_hSafetyTimer = null;
+
+    // We intentionally do NOT read or overwrite z_* ConVars here. Original
+    // values always come from the Director through the hook, so nothing leaks
+    // over from the previous map.
+    StartSafetyTimer();
+    QueueRecount(1.0);
 }
 
 public void OnConfigsExecuted()
 {
     // MultiSlots/CreateSurvivorBot may create survivors after configs execute.
-    CreateTimer(1.0, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
+    QueueRecount(1.0);
 }
 
 public void OnClientPutInServer(int client)
 {
-    // Covers real players and server-created survivor bots.
-    CreateTimer(0.5, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
+    QueueRecount(0.5);
+}
+
+public void OnClientDisconnect_Post(int client)
+{
+    // _Post: the client has fully left, so it is no longer counted.
+    QueueRecount(0.2);
 }
 
 public void OnMapEnd()
 {
-    ResetDebugState();
+    // Timers flagged TIMER_FLAG_NO_MAPCHANGE are killed automatically by
+    // SourceMod on map change. Their handles must be cleared so they are not
+    // treated as still active (and so StartSafetyTimer/QueueRecount will
+    // create new ones).
+    g_hRecountTimer = null;
+    g_hSafetyTimer = null;
+
+    ResetState();
 }
 
-void ResetDebugState()
+void ResetState()
 {
     g_iLivingSurvivors = 0;
+    g_fMultiplier = 1.0;
 
-    g_iLastOriginalCommon = -999999;
-    g_iLastOriginalMobSpawn = -999999;
-    g_iLastOriginalMegaMob = -999999;
-    g_iLastOriginalMobMin = -999999;
-    g_iLastOriginalMobMax = -999999;
-    g_iLastOriginalMobPending = -999999;
+    for (int i = 0; i < KEY_COUNT; i++)
+        g_bSeen[i] = false;
 
-    g_iLastFinalCommon = -999999;
-    g_iLastFinalMobSpawn = -999999;
-    g_iLastFinalMegaMob = -999999;
-    g_iLastFinalMobMin = -999999;
-    g_iLastFinalMobMax = -999999;
-    g_iLastFinalMobPending = -999999;
+    ClearDebugLog();
 }
 
-public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)
+// Forget what was last printed, so the next Director request for each key
+// is logged again.
+void ClearDebugLog()
 {
-    CreateTimer(0.5, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
+    for (int i = 0; i < KEY_COUNT; i++)
+        g_bLogged[i] = false;
 }
 
-public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
+// ===========================================================================
+// ConVars
+// ===========================================================================
+
+public void OnCvarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
 {
-    CreateTimer(0.2, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
-}
+    RefreshCvarCache();
 
-public void Event_SurvivorRescued(Event event, const char[] name, bool dontBroadcast)
-{
-    CreateTimer(0.2, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
-}
-
-public void Event_PlayerTeam(Event event, const char[] name, bool dontBroadcast)
-{
-    CreateTimer(0.2, Timer_UpdateSurvivorCount, _, TIMER_FLAG_NO_MAPCHANGE);
-}
-
-public Action Timer_UpdateSurvivorCount(Handle timer)
-{
-    if (!g_hEnabled.BoolValue)
-        return Plugin_Stop;
-
-    int count = CountLivingSurvivors();
-
-    if (count != g_iLivingSurvivors)
+    if (convar == g_hValueCap || convar == g_hDebug)
     {
-        g_iLivingSurvivors = count;
-
-        // Clear the debug cache so the next Director request prints the
-        // original and scaled value for the new multiplier.
-        ResetValueDebugCache();
-
-        PrintToServer(
-            "[CommonRegulator] Survivors=%d multiplier=%.2fx",
-            count,
-            GetMultiplier()
-        );
+        // A new cap changes the scaled results, so logs should print again.
+        ClearDebugLog();
+        return;
     }
 
+    // enabled / percent / max_multiplier: recompute the multiplier.
+    // The survivor count keeps updating even while the plugin is disabled,
+    // so it is already correct when re-enabled (fixes the stale count in v3.2).
+    RecalculateMultiplier(true);
+}
+
+void RefreshCvarCache()
+{
+    g_bEnabled  = g_hEnabled.BoolValue;
+    g_bDebug    = g_hDebug.BoolValue;
+    g_iValueCap = g_hValueCap.IntValue;
+}
+
+// ===========================================================================
+// Survivor counting
+// ===========================================================================
+
+// player_spawn and player_death also fire for special infected, and
+// player_death even fires for every common infected that dies (userid = 0,
+// victim in the "entityid" field). Without this filter, every zombie killed
+// would create a new timer.
+public void Event_SurvivorSpawnOrDeath(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+
+    if (client <= 0 || !IsClientInGame(client))
+        return;
+
+    if (GetClientTeam(client) != TEAM_SURVIVOR)
+        return;
+
+    QueueRecount(0.2);
+}
+
+// Rare events that are always relevant to survivors.
+// (player_team: team change; defib/rescue: survivor comes back to life;
+//  bot replace: bot <-> player takeover.)
+public void Event_AlwaysRecount(Event event, const char[] name, bool dontBroadcast)
+{
+    QueueRecount(0.2);
+}
+
+// Debounce: if a recount is already pending, don't create another timer.
+// Counting happens when the timer fires, so the pending recount is
+// guaranteed to see the latest state.
+void QueueRecount(float delay)
+{
+    if (g_hRecountTimer != null)
+        return;
+
+    g_hRecountTimer = CreateTimer(delay, Timer_Recount, _, TIMER_FLAG_NO_MAPCHANGE);
+}
+
+public Action Timer_Recount(Handle timer)
+{
+    // Only the tracked timer may clear the handle. An "orphan" timer from a
+    // previous map may still count (harmless), but must not clear the handle
+    // that belongs to the current timer.
+    if (timer == g_hRecountTimer)
+        g_hRecountTimer = null;
+
+    UpdateSurvivorCount();
     return Plugin_Stop;
 }
 
-public Action Command_Debug(int client, int args)
+void StartSafetyTimer()
 {
-    if (!g_hEnabled.BoolValue)
-    {
-        ReplyToCommand(client, "[CommonRegulator] Disabled (commonregulator=0).");
-        return Plugin_Handled;
-    }
+    if (g_hSafetyTimer != null)
+        return;
 
-    int actual = CountLivingSurvivors();
-
-    ReplyToCommand(client, "[CommonRegulator] DEBUG");
-    ReplyToCommand(client, "[CommonRegulator] Enabled=1 | LivingSurvivors=%d | CachedSurvivors=%d | Multiplier=%.2fx", actual, g_iLivingSurvivors, GetMultiplierForCount(actual));
-    ReplyToCommand(client, "[CommonRegulator] PercentPerSurvivor=%.2f", g_hPercent.FloatValue);
-    ReplyToCommand(client, "[CommonRegulator] Director hook=active; tracked keys: CommonLimit, MobSpawnSize, MegaMobSize, MobMinSize, MobMaxSize, MobMaxPending");
-    ReplyToCommand(client, "[CommonRegulator] Director key logs appear only when L4D2 requests a tracked script value.");
-
-    return Plugin_Handled;
+    g_hSafetyTimer = CreateTimer(SAFETY_RECOUNT_INTERVAL, Timer_Safety, _,
+        TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
 }
 
-float GetMultiplierForCount(int survivors)
+// Safety net: catches changes that have no event (or events we don't hook).
+// Cost is small: one MaxClients loop every 3 seconds.
+public Action Timer_Safety(Handle timer)
 {
-    int extraSurvivors = survivors - 4;
+    // Prevent duplicates: if this is not the tracked safety timer (a leftover
+    // from a map transition), stop it.
+    if (timer != g_hSafetyTimer)
+        return Plugin_Stop;
 
-    if (extraSurvivors <= 0)
-        return 1.0;
+    UpdateSurvivorCount();
+    return Plugin_Continue;
+}
 
-    // Calculate the percentage using integers first so values such as
-    // 20% per survivor are deterministic: 4=100%, 5=120%, 6=140%, etc.
-    int percent = RoundToNearest(g_hPercent.FloatValue);
-    int totalPercent = 100 + (extraSurvivors * percent);
+void UpdateSurvivorCount()
+{
+    int count = CountLivingSurvivors();
 
-    return float(totalPercent) / 100.0;
+    if (count == g_iLivingSurvivors)
+        return;
+
+    g_iLivingSurvivors = count;
+    RecalculateMultiplier(false);
 }
 
 int CountLivingSurvivors()
@@ -204,9 +334,12 @@ int CountLivingSurvivors()
         if (!IsClientInGame(client))
             continue;
 
-        if (GetClientTeam(client) != 2)
+        // Team 2 only. The L4D1 survivors in The Passing are on team 4
+        // and are intentionally not counted.
+        if (GetClientTeam(client) != TEAM_SURVIVOR)
             continue;
 
+        // Incapacitated survivors are still "alive", so they still count.
         if (!IsPlayerAlive(client))
             continue;
 
@@ -216,120 +349,167 @@ int CountLivingSurvivors()
     return count;
 }
 
-float GetMultiplier()
+// ===========================================================================
+// Multiplier & scaling
+// ===========================================================================
+
+float ComputeMultiplier(int survivors)
 {
-    return GetMultiplierForCount(g_iLivingSurvivors);
+    int extraSurvivors = survivors - BASE_SURVIVORS;
+
+    if (extraSurvivors <= 0)
+        return 1.0;
+
+    // The percentage is used as a float, so 12.5 really means 12.5%
+    // (v3.2 silently rounded it to 13).
+    float multiplier = 1.0 + float(extraSurvivors) * g_hPercent.FloatValue / 100.0;
+
+    // Upper bound: without it, 12 survivors x 100% = 9x commons -> edict crash risk.
+    float maxMultiplier = g_hMaxMultiplier.FloatValue;
+    if (multiplier > maxMultiplier)
+        multiplier = maxMultiplier;
+
+    return multiplier;
+}
+
+void RecalculateMultiplier(bool forceLog)
+{
+    float oldMultiplier = g_fMultiplier;
+    g_fMultiplier = ComputeMultiplier(g_iLivingSurvivors);
+
+    bool changed = (oldMultiplier != g_fMultiplier);
+
+    // A new multiplier changes every scaled result, so Director logs should
+    // print again for each key.
+    if (changed)
+        ClearDebugLog();
+
+    if (changed || forceLog)
+    {
+        PrintToServer("[CommonRegulator] Enabled=%d Survivors=%d multiplier=%.2fx",
+            g_bEnabled, g_iLivingSurvivors, g_fMultiplier);
+    }
 }
 
 int ScaleDirectorValue(int original)
 {
-    // Director uses negative values for some "unlimited/default" settings.
-    // Never turn -1 into -2, etc.
-    if (original < 0)
+    // Negative = special/"default" Director value; 0 = the map deliberately
+    // disabled it (e.g. no mobs). Neither should be changed.
+    if (original <= 0)
         return original;
 
-    return RoundToNearest(float(original) * GetMultiplier());
+    int scaled = RoundToNearest(float(original) * g_fMultiplier);
+
+    if (g_iValueCap > 0 && scaled > g_iValueCap)
+    {
+        // If the map's own value is already above the cap, keep it: this
+        // plugin may only INCREASE values, never shrink the map's tuning.
+        scaled = (original > g_iValueCap) ? original : g_iValueCap;
+    }
+
+    // Note on MobMinSize vs MobMaxSize: this function is monotonic (a larger
+    // original never produces a smaller result), so if the map has
+    // Min <= Max, the result also keeps Min <= Max. No cross-clamp needed.
+    return scaled;
 }
 
-bool IsTrackedDirectorKey(const char[] key)
-{
-    return StrEqual(key, "CommonLimit")
-        || StrEqual(key, "cm_CommonLimit")
-        || StrEqual(key, "MobSpawnSize")
-        || StrEqual(key, "MegaMobSize")
-        || StrEqual(key, "MobMinSize")
-        || StrEqual(key, "MobMaxSize")
-        || StrEqual(key, "MobMaxPending");
-}
+// ===========================================================================
+// Director hook (left4dhooks)
+// ===========================================================================
 
-public Action L4D2_OnGetScriptValueInt(const char[] key, int &retVal, int hScope)
+// Hooks CDirector::GetScriptValue(const char*, int), which is how the Director
+// reads its own options (CommonLimit, MobMaxSize, ...) from DirectorOptions,
+// falling back to the matching z_* cvar when the map does not set one.
+//
+// Do NOT use L4D2_OnGetScriptValueInt(key, retVal, hScope) for this: that
+// forward fires on the VScript VM value getter (Squirrel code reading a
+// value), not on Director option lookups, so it never sees these keys.
+// That was the reason v3.2/v3.3 never scaled anything.
+//
+// Called VERY often by the Director. Checks are ordered cheapest first so the
+// common case (4 players / plugin off) exits as fast as possible.
+public Action L4D_OnGetScriptValueInt(const char[] key, int &retVal)
 {
-    if (!g_hEnabled.BoolValue || g_iLivingSurvivors <= 0)
+    // Fast path: a 1.0 multiplier means nothing needs to change.
+    // The exact float comparison is safe because 1.0 is assigned directly,
+    // not computed.
+    if (!g_bEnabled || g_fMultiplier == 1.0)
         return Plugin_Continue;
 
-    if (!IsTrackedDirectorKey(key))
+    int index;
+    if (!g_hKeyIndex.GetValue(key, index))
         return Plugin_Continue;
 
     int original = retVal;
     int scaled = ScaleDirectorValue(original);
 
-    // A mob's min size should never exceed its max size. We cannot know the
-    // final max here if the Director asks for the values in another order, so
-    // leave the individual Director value untouched apart from the multiplier.
+    g_bSeen[index] = true;
+    g_iLastOriginal[index] = original;
+    g_iLastScaled[index] = scaled;
+
+    if (scaled == original)
+        return Plugin_Continue;
+
+    if (g_bDebug)
+        DebugDirectorValue(index, original, scaled);
+
     retVal = scaled;
 
-    DebugDirectorValue(key, original, scaled, hScope);
-
-    return Plugin_Changed;
+    // IMPORTANT: the forward's documentation states the override value is
+    // only used when returning Plugin_Handled. v3.2 returned Plugin_Changed,
+    // which risks being ignored. Plugin_Handled here does NOT block anything;
+    // it just means "use the retVal I modified".
+    return Plugin_Handled;
 }
 
-void DebugDirectorValue(const char[] key, int original, int scaled, int hScope)
+void DebugDirectorValue(int index, int original, int scaled)
 {
-    bool changed = false;
-
-    if (StrEqual(key, "CommonLimit") || StrEqual(key, "cm_CommonLimit"))
+    // Only print when the value differs from the last one printed for this
+    // key. The Director asks for the same key many times per second, so
+    // without this the console would be flooded.
+    if (g_bLogged[index]
+        && g_iLoggedOriginal[index] == original
+        && g_iLoggedScaled[index] == scaled)
     {
-        changed = (original != g_iLastOriginalCommon || scaled != g_iLastFinalCommon);
-        g_iLastOriginalCommon = original;
-        g_iLastFinalCommon = scaled;
-    }
-    else if (StrEqual(key, "MobSpawnSize"))
-    {
-        changed = (original != g_iLastOriginalMobSpawn || scaled != g_iLastFinalMobSpawn);
-        g_iLastOriginalMobSpawn = original;
-        g_iLastFinalMobSpawn = scaled;
-    }
-    else if (StrEqual(key, "MegaMobSize"))
-    {
-        changed = (original != g_iLastOriginalMegaMob || scaled != g_iLastFinalMegaMob);
-        g_iLastOriginalMegaMob = original;
-        g_iLastFinalMegaMob = scaled;
-    }
-    else if (StrEqual(key, "MobMinSize"))
-    {
-        changed = (original != g_iLastOriginalMobMin || scaled != g_iLastFinalMobMin);
-        g_iLastOriginalMobMin = original;
-        g_iLastFinalMobMin = scaled;
-    }
-    else if (StrEqual(key, "MobMaxSize"))
-    {
-        changed = (original != g_iLastOriginalMobMax || scaled != g_iLastFinalMobMax);
-        g_iLastOriginalMobMax = original;
-        g_iLastFinalMobMax = scaled;
-    }
-    else if (StrEqual(key, "MobMaxPending"))
-    {
-        changed = (original != g_iLastOriginalMobPending || scaled != g_iLastFinalMobPending);
-        g_iLastOriginalMobPending = original;
-        g_iLastFinalMobPending = scaled;
-    }
-
-    if (!changed)
         return;
+    }
+
+    g_bLogged[index] = true;
+    g_iLoggedOriginal[index] = original;
+    g_iLoggedScaled[index] = scaled;
 
     PrintToServer(
-        "[CommonRegulator] Director key=%s original=%d -> scaled=%d (scope=%d, multiplier=%.2fx)",
-        key,
-        original,
-        scaled,
-        hScope,
-        GetMultiplier()
-    );
+        "[CommonRegulator] Director key=%s original=%d -> scaled=%d (multiplier=%.2fx)",
+        g_sKeyNames[index], original, scaled, g_fMultiplier);
 }
 
-void ResetValueDebugCache()
-{
-    g_iLastOriginalCommon = -999999;
-    g_iLastOriginalMobSpawn = -999999;
-    g_iLastOriginalMegaMob = -999999;
-    g_iLastOriginalMobMin = -999999;
-    g_iLastOriginalMobMax = -999999;
-    g_iLastOriginalMobPending = -999999;
+// ===========================================================================
+// Admin command
+// ===========================================================================
 
-    g_iLastFinalCommon = -999999;
-    g_iLastFinalMobSpawn = -999999;
-    g_iLastFinalMegaMob = -999999;
-    g_iLastFinalMobMin = -999999;
-    g_iLastFinalMobMax = -999999;
-    g_iLastFinalMobPending = -999999;
+public Action Command_Debug(int client, int args)
+{
+    int actual = CountLivingSurvivors();
+
+    ReplyToCommand(client, "[CommonRegulator] DEBUG v%s", PLUGIN_VERSION);
+    ReplyToCommand(client, "[CommonRegulator] Enabled=%d | LivingSurvivors=%d | CachedSurvivors=%d",
+        g_bEnabled, actual, g_iLivingSurvivors);
+    ReplyToCommand(client, "[CommonRegulator] Multiplier=%.2fx (percent=%.2f, max=%.2fx) | ValueCap=%d | Debug=%d",
+        g_fMultiplier, g_hPercent.FloatValue, g_hMaxMultiplier.FloatValue, g_iValueCap, g_bDebug);
+
+    // This data is only filled while the multiplier is above 1.0, because the
+    // hook's fast path returns before recording anything at 1.0.
+    for (int i = 0; i < KEY_COUNT; i++)
+    {
+        if (!g_bSeen[i])
+        {
+            ReplyToCommand(client, "  %s : (not requested by the Director since multiplier > 1.0)", g_sKeyNames[i]);
+            continue;
+        }
+
+        ReplyToCommand(client, "  %s : %d -> %d",
+            g_sKeyNames[i], g_iLastOriginal[i], g_iLastScaled[i]);
+    }
+
+    return Plugin_Handled;
 }
